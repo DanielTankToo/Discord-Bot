@@ -13,9 +13,9 @@ Built in Python with discord.py. It runs on your own Windows PC, with no paid ho
 
 | Date | Change |
 |---|---|
-| Nov 2026 | **Pictures on listings.** Every form now starts with a picture/screenshot upload. The picture is the big main image on the listing and is copied into the completed channel. |
-| Nov 2026 | The bot keeps its own copy of each picture in a `pictures` folder, so completed records always get the picture. |
-| Nov 2026 | Pictures are deleted from the `pictures` folder automatically once a listing closes. |
+| Nov 2026 | **Pictures on listings.** Every form starts with a picture/screenshot upload. The picture is the big main image on the listing and is copied into the completed channel. |
+| Nov 2026 | **Automatic picture cleanup.** The bot keeps a copy of each picture only while the listing is open, then deletes it. |
+| Nov 2026 | `.gitignore` added, so `.env`, `marketplace.db` and `pictures` never go to GitHub. |
 | Earlier | Sell category drop-down, profession drop-down for crafting orders, automatic listing expiry, forum tags, DM notifications. |
 
 ---
@@ -226,6 +226,34 @@ No spaces or quotes go around the values.
 
 ---
 
+## Keeping GitHub clean
+
+Your GitHub repo should only ever contain `bot.py`, `README.md`, `requirements.txt`,
+`.gitignore`, `.gitattributes` and `.env.example`. The `.gitignore` file keeps everything
+else off GitHub. It should contain:
+
+```
+.env
+marketplace.db
+marketplace.db-journal
+pictures/
+__pycache__/
+*.pyc
+```
+
+To see or change it without the command line: in **GitHub Desktop**, click
+**Repository → Repository settings… → Ignored files**, edit the list, click **Save**, then
+commit and push the `.gitignore` change.
+
+If something private ever shows up in GitHub Desktop's **Changes** list, **don't commit**.
+Right-click it and choose **Ignore file (add to .gitignore)** instead.
+
+If `.env` is ever uploaded by mistake, delete it on github.com (click the file → **⋯** →
+**Delete file**), back up your local copy first because pulling that deletion removes it
+from your PC, and **reset the bot token** in the Developer Portal.
+
+---
+
 ## Troubleshooting
 
 | Problem | Fix |
@@ -244,6 +272,8 @@ No spaces or quotes go around the values.
 | No picture box in the forms | discord.py is too old. Run `pip install -U -r requirements.txt`, then restart the bot. Members may also need to update their Discord app. |
 | Listing posts but the picture is missing | The bot needs **Attach Files** in the forum. Check your DM; it says if the picture was too big or not an image. |
 | Completed record has no picture | The bot needs **Attach Files** in the completed channel. Check the terminal for a `[!]` line. Listings posted before the `pictures` folder existed may not carry their picture over. |
+| Pictures or `.env` show up in GitHub Desktop's Changes | `.gitignore` is missing a line. Add it in **Repository → Repository settings… → Ignored files** (see **Keeping GitHub clean**). |
+| The `pictures` folder isn't emptying | Pictures stay while a listing is open or claimed. Finished ones are cleared within an hour, or right away on restart. Check the terminal for a `[!]` line. |
 | The bot posts a `[!]` line in the terminal | It's a warning that says what's wrong, usually a channel ID or permission. |
 
 ---
@@ -262,6 +292,7 @@ machine (an old laptop, a Raspberry Pi, or a small cloud server). Install Python
 - [x] Sell category drop-down
 - [x] Listings that expire automatically after X days
 - [x] Picture/screenshot upload on every listing form
+- [x] Automatic cleanup of saved pictures
 - [ ] Auctions with timed bidding
 - [ ] Trade reputation, so members can rate completed trades
 - [ ] Ping actual crafters from the guild roster tool instead of Discord roles
