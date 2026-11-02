@@ -1,0 +1,17 @@
+# Secrets — never upload these
+.env
+.env.*
+!.env.example
+
+# The bot's database (your guild's listings and sales history)
+marketplace.db
+*.db
+*.db-journal
+
+# Python junk
+__pycache__/
+*.pyc
+
+# Windows junk
+Thumbs.db
+desktop.ini
