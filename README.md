@@ -15,6 +15,7 @@ Built in Python with discord.py. It runs on your own Windows PC, with no paid ho
 |---|---|
 | Nov 2026 | **Pictures on listings.** Every form now starts with a picture/screenshot upload. The picture is the big main image on the listing and is copied into the completed channel. |
 | Nov 2026 | The bot keeps its own copy of each picture in a `pictures` folder, so completed records always get the picture. |
+| Nov 2026 | Pictures are deleted from the `pictures` folder automatically once a listing closes. |
 | Earlier | Sell category drop-down, profession drop-down for crafting orders, automatic listing expiry, forum tags, DM notifications. |
 
 ---
@@ -55,8 +56,10 @@ image from your PC, or paste a screenshot.
 - The picture is optional. Without one, the listing looks the same as before.
 - If the upload isn't a picture or is too big, the listing still posts, and the poster's
   confirmation DM says why the picture was left off.
-- The bot keeps a copy of each picture in the `pictures` folder. You can delete old files
-  there whenever you like; they're only needed until the trade is finished.
+- The bot keeps a copy of each picture in the `pictures` folder while the listing is open.
+  It deletes the copy automatically when the listing is sold/filled/crafted (after copying
+  the picture into the completed channel), removed, or expires. Once an hour (and at
+  startup) it also clears out any leftover pictures from finished listings.
 - Needs **discord.py 2.6 or newer**. On an older version the forms still work without the
   picture box, and the terminal shows a `[!]` line saying to update.
 
@@ -104,7 +107,7 @@ progress. The bot checks every 15 minutes while it's running.
 | `.gitignore` | Tells GitHub Desktop which files to leave out. | Yes |
 | `.env` | Your settings and secret bot token. | **Never** |
 | `marketplace.db` | Created automatically. Stores all listings and history. **Back this up** (copy it somewhere safe). | **Never** |
-| `pictures/` | Created automatically. The bot's copies of listing pictures. | No |
+| `pictures/` | Created automatically. Pictures for open listings; cleaned up automatically. | No |
 
 The `.gitignore` file already leaves out `.env`, `marketplace.db` and `pictures/`, so
 GitHub Desktop won't offer to upload them.

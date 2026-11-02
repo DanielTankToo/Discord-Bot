@@ -460,7 +460,10 @@ async def log_activity(bot: commands.Bot, text: str,
 
 
 async def update_announcement(bot: commands.Bot, row: sqlite3.Row) -> None:
-    """Rewrite a listing's 'New for sale' announcement to show it's sold/crafted/removed."""
+    """Rewrite a listing's 'New for sale' announcement to show it's sold/crafted/removed.
+    Every way a listing closes comes through here, so this also deletes its saved picture."""
+    if row["status"] in CLOSED_STATUSES:
+        delete_picture(row)
     if not (ACTIVITY_CHANNEL_ID and row["activity_message_id"]):
         return
     channel = bot.get_channel(ACTIVITY_CHANNEL_ID)
@@ -542,6 +545,47 @@ def save_picture(listing_id: int, image_name: str, data: bytes) -> None:
         print(f"[!] Couldn't save the picture for listing #{listing_id}: {e}")
 
 
+def delete_picture(row: sqlite3.Row) -> None:
+    """Remove a closed listing's saved picture. It's no longer needed once the listing is
+    finished (the completed channel has its own copy)."""
+    if not row["image_name"]:
+        return
+    try:
+        os.remove(picture_path(row["id"], row["image_name"]))
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        print(f"[!] Couldn't delete the saved picture for listing #{row['id']}: {e}")
+
+
+def clean_pictures_folder() -> int:
+    """Delete saved pictures whose listing is closed or no longer exists. Returns how many."""
+    if not os.path.isdir(PICTURES_DIR):
+        return 0
+    deleted = 0
+    for name in os.listdir(PICTURES_DIR):
+        path = os.path.join(PICTURES_DIR, name)
+        if not os.path.isfile(path):
+            continue
+        listing_id = name.split("-", 1)[0]
+        row = get_listing(int(listing_id)) if listing_id.isdigit() else None
+        if row is not None and row["status"] not in CLOSED_STATUSES:
+            continue  # still open or claimed: keep it for the completed record
+        try:
+            os.remove(path)
+            deleted += 1
+        except OSError as e:
+            print(f"[!] Couldn't delete {path}: {e}")
+    return deleted
+
+
+@tasks.loop(hours=1)
+async def picture_cleanup() -> None:
+    deleted = clean_pictures_folder()
+    if deleted:
+        print(f"Cleaned up {deleted} picture(s) from finished listings.")
+
+
 async def listing_picture_file(bot: commands.Bot, row: sqlite3.Row,
                                message: discord.Message | None = None) -> discord.File | None:
     """Get a listing's picture as a file to post: from the saved copy first, then from Discord."""
@@ -550,7 +594,11 @@ async def listing_picture_file(bot: commands.Bot, row: sqlite3.Row,
         return None
     path = picture_path(row["id"], name)
     if os.path.exists(path):
-        return discord.File(path, filename=name)
+        try:
+            with open(path, "rb") as f:
+                return discord.File(io.BytesIO(f.read()), filename=name)
+        except OSError as e:
+            print(f"[!] Couldn't read the saved picture for listing #{row['id']}: {e}")
 
     # No saved copy (e.g. listing posted before this update): take it from the listing message.
     if message is None and row["channel_id"] and row["message_id"]:
@@ -1133,6 +1181,8 @@ class MarketplaceBot(commands.Bot):
             self._panel_ready = True
             await refresh_panel(self)
             print("Marketplace panel is ready.")
+        if not picture_cleanup.is_running():
+            picture_cleanup.start()  # also clears out leftovers right away on startup
         if LISTING_EXPIRY_DAYS > 0 and not expiry_check.is_running():
             expiry_check.start(self)
             print(f"Unclaimed listings expire after {LISTING_EXPIRY_DAYS:g} day(s).")
