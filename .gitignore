@@ -1,6 +1,0 @@
-.env
-marketplace.db
-marketplace.db-journal
-pictures/
-__pycache__/
-*.pyc
