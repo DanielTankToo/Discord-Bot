@@ -7,11 +7,13 @@ button panel and pop-up forms (no slash commands needed by members).
 Members click buttons on a pinned panel to:
   * Sell an Item        -> posts a "WTS" listing
   * Want to Buy         -> posts a "WTB" request
-  * Crafting Request    -> posts a craft order and pings the profession role
+  * Crafting Request    -> pick a profession from a drop-down, then fill in the
+                           order; pings everyone with that profession's role
   * Browse / Search     -> private list of open listings with jump links
   * My Listings         -> private list of your own open listings
 
 Each listing has buttons to claim it, release it, mark it done, or remove it.
+Unclaimed listings expire automatically after LISTING_EXPIRY_DAYS (default 2).
 Gold and items change hands in-game; the bot only tracks listings.
 """
 
@@ -19,10 +21,10 @@ import asyncio
 import os
 import re
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 from dotenv import load_dotenv
 
 # --------------------------------------------------------------------------
@@ -41,6 +43,11 @@ ACTIVITY_CHANNEL_ID = int(os.getenv("ACTIVITY_CHANNEL_ID", "0") or 0)
 # Optional: a channel where finished trades are moved to (a sales history).
 COMPLETED_CHANNEL_ID = int(os.getenv("COMPLETED_CHANNEL_ID", "0") or 0)
 DB_PATH = os.getenv("DB_PATH", "marketplace.db")
+# Optional: unclaimed listings close automatically after this many days. 0 turns it off.
+try:
+    LISTING_EXPIRY_DAYS = float(os.getenv("LISTING_EXPIRY_DAYS", "2") or 2)
+except ValueError:
+    LISTING_EXPIRY_DAYS = 2.0
 
 # Listing types
 WTS, WTB, CRAFT = "WTS", "WTB", "CRAFT"
@@ -80,6 +87,34 @@ def normalize_profession(text: str) -> str | None:
     return None
 
 
+# Professions offered in the Crafting Request drop-down (the ones that make things).
+CRAFT_PROFESSIONS = [
+    ("alchemy", "🧪"), ("blacksmithing", "⚒️"), ("enchanting", "✨"), ("engineering", "⚙️"),
+    ("leatherworking", "🧥"), ("tailoring", "🧵"), ("cooking", "🍖"), ("first aid", "🩹"),
+]
+
+
+# Categories offered in the Sell an Item drop-down. The value is also matched against forum tags.
+SELL_CATEGORIES = [
+    ("Weapon", "⚔️"), ("Cloth Armor", "👘"), ("Leather Armor", "🥾"), ("Mail Armor", "⛓️"),
+    ("Plate Armor", "🛡️"), ("Material", "🪨"), ("Recipe", "📖"), ("Consumable", "🧪"),
+]
+CATEGORY_EMOJI = dict(SELL_CATEGORIES)
+
+
+def find_profession_role(guild: discord.Guild, profession: str) -> discord.Role | None:
+    """Find the Discord role for a profession. Matches the exact name first, then shorthand
+    like 'BS' or 'Blacksmith', ignoring capitals, spaces and emojis in the role name."""
+    exact = discord.utils.find(lambda r: r.name.strip().lower() == profession.lower(), guild.roles)
+    if exact:
+        return exact
+    for role in guild.roles:
+        cleaned = re.sub(r"[^a-z ]", "", role.name.lower()).strip()
+        if cleaned and normalize_profession(cleaned) == profession:
+            return role
+    return None
+
+
 # --------------------------------------------------------------------------
 # Database (SQLite file next to the bot -- survives restarts)
 # --------------------------------------------------------------------------
@@ -110,6 +145,12 @@ db.executescript(
 # Upgrade older databases: remember the announcement message for each listing.
 if "activity_message_id" not in [c[1] for c in db.execute("PRAGMA table_info(listings)")]:
     db.execute("ALTER TABLE listings ADD COLUMN activity_message_id INTEGER")
+# Upgrade older databases: item category for things for sale.
+if "category" not in [c[1] for c in db.execute("PRAGMA table_info(listings)")]:
+    db.execute("ALTER TABLE listings ADD COLUMN category TEXT")
+# Upgrade older databases (column from an earlier version; no longer used).
+if "ping_message_id" not in [c[1] for c in db.execute("PRAGMA table_info(listings)")]:
+    db.execute("ALTER TABLE listings ADD COLUMN ping_message_id INTEGER")
 db.commit()
 
 
@@ -141,6 +182,16 @@ def jump_url(row: sqlite3.Row) -> str:
     return f"https://discord.com/channels/{row['guild_id']}/{row['channel_id']}/{row['message_id']}"
 
 
+CLOSED_STATUSES = ("done", "removed", "expired")
+
+
+def expires_at(row: sqlite3.Row) -> datetime | None:
+    """When an unclaimed listing will expire, or None if expiry is turned off."""
+    if LISTING_EXPIRY_DAYS <= 0:
+        return None
+    return datetime.fromisoformat(row["created_at"]) + timedelta(days=LISTING_EXPIRY_DAYS)
+
+
 def listing_embed(row: sqlite3.Row) -> discord.Embed:
     info = TYPE_INFO[row["type"]]
     status = row["status"]
@@ -155,6 +206,9 @@ def listing_embed(row: sqlite3.Row) -> discord.Embed:
 
     if row["type"] == CRAFT and row["profession"]:
         embed.add_field(name="Profession", value=row["profession"].title())
+    if row["category"]:
+        embed.add_field(name="Category",
+                        value=f"{CATEGORY_EMOJI.get(row['category'], '')} {row['category']}".strip())
     if row["price"]:
         label = {WTS: "Price", WTB: "Paying up to", CRAFT: "Tip offered"}[row["type"]]
         embed.add_field(name=label, value=row["price"])
@@ -168,8 +222,12 @@ def listing_embed(row: sqlite3.Row) -> discord.Embed:
     elif status == "done":
         who = f" (with <@{row['claimed_by']}>)" if row["claimed_by"] else ""
         embed.add_field(name="Status", value=f"Closed{who}", inline=False)
+    elif status == "expired":
+        embed.add_field(name="Status", value="⌛ Expired", inline=False)
     else:
-        embed.add_field(name="Status", value="🟢 Open", inline=False)
+        expiry = expires_at(row)
+        until = f" — expires <t:{int(expiry.timestamp())}:R> if nobody claims it" if expiry else ""
+        embed.add_field(name="Status", value=f"🟢 Open{until}", inline=False)
 
     embed.set_footer(text=f"Listing #{row['id']}")
     embed.timestamp = datetime.fromisoformat(row["created_at"])
@@ -178,7 +236,7 @@ def listing_embed(row: sqlite3.Row) -> discord.Embed:
 
 def listing_view(row: sqlite3.Row) -> discord.ui.View | None:
     """Buttons shown under a listing, based on its current state."""
-    if row["status"] in ("done", "removed"):
+    if row["status"] in CLOSED_STATUSES:
         return None
     info = TYPE_INFO[row["type"]]
     view = discord.ui.View(timeout=None)
@@ -202,6 +260,8 @@ def format_lines(rows: list[sqlite3.Row], limit_chars: int = 1000) -> str:
     for r in rows:
         extra = f" — {r['price']}" if r["price"] else ""
         prof = f" ({r['profession'].title()})" if r["type"] == CRAFT and r["profession"] else ""
+        if r["category"]:
+            prof = f" ({r['category']})"
         claimed = " 🤝" if r["status"] == "claimed" else ""
         line = f"• [{r['item']}]({jump_url(r)}){prof}{extra} — <@{r['user_id']}>{claimed}"
         if total + len(line) > limit_chars:
@@ -325,10 +385,24 @@ TYPE_TAG_NAMES = {
 DONE_TAG_NAMES = ["sold", "closed", "done", "completed", "filled", "crafted"]
 
 
+def _tag_key(name: str) -> str:
+    """'⚔️ Weapons' -> 'weapon': ignore emojis, capitals, extra spaces and a plural 's'."""
+    key = " ".join(re.sub(r"[^a-z ]", " ", name.lower()).split())
+    return key[:-1] if key.endswith("s") and len(key) > 3 else key
+
+
 def forum_tags(forum: discord.ForumChannel, names: list[str]) -> list[discord.ForumTag]:
-    """Pick the forum's tags whose names match any of `names` (case-insensitive). Max 5."""
-    wanted = {n.lower() for n in names}
-    return [t for t in forum.available_tags if t.name.lower() in wanted][:5]
+    """Pick the forum's tags whose names match any of `names`. Max 5 (Discord's limit).
+    Matching ignores emojis, capitals and plurals, and 'Plate' matches 'Plate Armor'."""
+    wanted = [_tag_key(n) for n in names if _tag_key(n)]
+    picked = []
+    for want in wanted:  # keep the order asked for, so the listing type tag comes first
+        for tag in forum.available_tags:
+            key = _tag_key(tag.name)
+            if tag not in picked and key and (key == want or
+                                              (" " in want and want.split()[0] == key)):
+                picked.append(tag)
+    return picked[:5]
 
 
 async def close_forum_post(thread: discord.Thread, delete: bool = False) -> None:
@@ -387,6 +461,8 @@ async def update_announcement(bot: commands.Bot, row: sqlite3.Row) -> None:
     price_txt = f" — {row['price']}" if row["price"] else ""
     if row["status"] == "removed":
         text = f"🗑️ ~~{row['item']}{price_txt}~~ — **REMOVED** (by <@{row['user_id']}>)"
+    elif row["status"] == "expired":
+        text = f"⌛ ~~{row['item']}{price_txt}~~ — **EXPIRED** (by <@{row['user_id']}>)"
     else:
         partner = f" with <@{row['claimed_by']}>" if row["claimed_by"] else ""
         text = (f"✅ **{info['done'].upper()}:** {item_link(row)}{price_txt} — "
@@ -423,10 +499,15 @@ async def move_to_completed(bot: commands.Bot, row: sqlite3.Row) -> bool:
 
 
 async def post_listing(interaction: discord.Interaction, ltype: str, item: str, price: str | None,
-                       quantity: str | None, notes: str | None, profession: str | None = None) -> None:
+                       quantity: str | None, notes: str | None, profession: str | None = None,
+                       from_picker: bool = False, category: str | None = None) -> None:
     bot = interaction.client
     # Acknowledge right away (silently) so Discord doesn't time out while we post.
-    await interaction.response.defer()
+    if from_picker:
+        # The form was opened from a private drop-down message: swap it for a status line.
+        await interaction.response.edit_message(content="⏳ Posting your listing…", view=None)
+    else:
+        await interaction.response.defer()
 
     channel = bot.get_channel(LISTINGS_CHANNEL_ID)
     if channel is None:
@@ -436,10 +517,10 @@ async def post_listing(interaction: discord.Interaction, ltype: str, item: str, 
         return
 
     cur = db.execute(
-        "INSERT INTO listings (type, guild_id, user_id, item, price, quantity, notes, profession, created_at)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO listings (type, guild_id, user_id, item, price, quantity, notes, profession,"
+        " category, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (ltype, interaction.guild_id, interaction.user.id, item, price or None, quantity or None,
-         notes or None, profession, datetime.now(timezone.utc).isoformat()),
+         notes or None, profession, category, datetime.now(timezone.utc).isoformat()),
     )
     db.commit()
     row = get_listing(cur.lastrowid)
@@ -449,8 +530,15 @@ async def post_listing(interaction: discord.Interaction, ltype: str, item: str, 
     allowed = discord.AllowedMentions.none()
     role = None
     if ltype == CRAFT and profession and interaction.guild:
-        role = discord.utils.find(lambda r: r.name.lower() == profession.lower(), interaction.guild.roles)
-        if role and not ACTIVITY_CHANNEL_ID:
+        role = find_profession_role(interaction.guild, profession)
+        if role is None:
+            print(f"[!] No role found for '{profession.title()}', so nobody was pinged. "
+                  f"Create a role named '{profession.title()}' and give it to your crafters.")
+        elif not role.mentionable and not channel.permissions_for(interaction.guild.me).mention_everyone:
+            print(f"[!] Can't ping the '{role.name}' role. Either give the bot 'Mention @everyone, "
+                  f"@here, and All Roles', or turn on 'Allow anyone to @mention this role' for the role.")
+        if role:
+            # The ping goes in the listing itself, so it disappears when the post is closed.
             content = f"{role.mention} — new crafting order!"
             allowed = discord.AllowedMentions(roles=[role])
 
@@ -458,7 +546,8 @@ async def post_listing(interaction: discord.Interaction, ltype: str, item: str, 
         # Each listing becomes its own forum post; trade talk happens inside it.
         info = TYPE_INFO[ltype]
         name = f"[{info['title']}] {item}" + (f" — {price}" if price else "")
-        tags = forum_tags(channel, TYPE_TAG_NAMES[ltype] + ([profession] if profession else []))
+        tags = forum_tags(channel, TYPE_TAG_NAMES[ltype] + ([profession] if profession else [])
+                          + ([category] if category else []))
         created = await channel.create_thread(
             name=name[:100], content=content, embed=listing_embed(row), view=listing_view(row),
             allowed_mentions=allowed, applied_tags=tags)
@@ -472,21 +561,30 @@ async def post_listing(interaction: discord.Interaction, ltype: str, item: str, 
     row = get_listing(row["id"])
     info = TYPE_INFO[ltype]
     price_txt = f" — {row['price']}" if row["price"] else ""
-    ping = f"{role.mention} " if role else ""
     announcement = await log_activity(
         bot,
-        f"{ping}{info['emoji']} **New {info['title'].lower()}:** {item_link(row)}{price_txt} "
+        f"{info['emoji']} **New {info['title'].lower()}:** {item_link(row)}{price_txt} "
         f"by <@{row['user_id']}>",
-        discord.AllowedMentions(roles=[role]) if role else None,
     )
     if announcement:
         update_listing(row["id"], activity_message_id=announcement.id)
 
     # Confirm to the poster by DM, so nothing shows up in the marketplace channel.
     info = TYPE_INFO[ltype]
+    dm_sent = False
     try:
         await interaction.user.send(f"{info['emoji']} Your listing **{item}** is posted: {msg.jump_url}")
+        dm_sent = True
     except discord.HTTPException:
+        pass  # the poster has DMs from server members turned off
+
+    if from_picker:
+        # Remove the private profession drop-down message now that the order is posted.
+        try:
+            await interaction.delete_original_response()
+        except discord.HTTPException:
+            pass
+    if not dm_sent:
         # DMs closed: fall back to a private "only you can see this" message.
         await interaction.followup.send(f"Posted! {msg.jump_url}", ephemeral=True)
 
@@ -533,9 +631,14 @@ class SellModal(MarketModal, title="Sell an Item"):
                                  placeholder="Stats, when you're online, open to offers, etc.",
                                  max_length=500)
 
+    def __init__(self, category: str):
+        super().__init__(title=f"Sell an Item — {category}"[:45])
+        self.category = category
+
     async def on_submit(self, interaction: discord.Interaction):
         await post_listing(interaction, WTS, self.item.value.strip(), self.price.value.strip(),
-                           self.quantity.value.strip(), self.notes.value.strip())
+                           self.quantity.value.strip(), self.notes.value.strip(),
+                           from_picker=True, category=self.category)
 
 
 class BuyModal(MarketModal, title="Want to Buy"):
@@ -552,8 +655,6 @@ class BuyModal(MarketModal, title="Want to Buy"):
 
 
 class CraftModal(MarketModal, title="Crafting Request"):
-    profession = discord.ui.TextInput(label="Profession", placeholder="e.g. Blacksmithing, Tailoring, LW",
-                                      max_length=30)
     item = discord.ui.TextInput(label="What do you want crafted?", max_length=100)
     materials = discord.ui.TextInput(label="Materials", required=False, max_length=200,
                                      placeholder="e.g. I have all mats / need the crafter to supply")
@@ -561,14 +662,61 @@ class CraftModal(MarketModal, title="Crafting Request"):
     notes = discord.ui.TextInput(label="Notes", style=discord.TextStyle.paragraph, required=False,
                                  max_length=400)
 
+    def __init__(self, profession: str):
+        super().__init__(title=f"Crafting Request — {profession.title()}"[:45])
+        self.profession = profession
+
     async def on_submit(self, interaction: discord.Interaction):
-        prof = normalize_profession(self.profession.value) or self.profession.value.strip().lower()
         notes = "\n".join(filter(None, [
             f"**Materials:** {self.materials.value.strip()}" if self.materials.value.strip() else "",
             self.notes.value.strip(),
         ]))
         await post_listing(interaction, CRAFT, self.item.value.strip(), self.price.value.strip(),
-                           None, notes, profession=prof)
+                           None, notes, profession=self.profession, from_picker=True)
+
+
+class CategorySelect(discord.ui.Select):
+    """Drop-down shown privately when someone clicks Sell an Item."""
+
+    def __init__(self):
+        super().__init__(
+            placeholder="Choose a category…",
+            options=[discord.SelectOption(label=name, value=name, emoji=emoji)
+                     for name, emoji in SELL_CATEGORIES])
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.send_modal(SellModal(self.values[0]))
+
+
+class CategoryPickerView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=600)
+        self.add_item(CategorySelect())
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item) -> None:
+        await report_error(interaction, error)
+
+
+class ProfessionSelect(discord.ui.Select):
+    """Drop-down shown privately when someone clicks Crafting Request."""
+
+    def __init__(self):
+        super().__init__(
+            placeholder="Choose a profession…",
+            options=[discord.SelectOption(label=name.title(), value=name, emoji=emoji)
+                     for name, emoji in CRAFT_PROFESSIONS])
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.send_modal(CraftModal(self.values[0]))
+
+
+class ProfessionPickerView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=600)
+        self.add_item(ProfessionSelect())
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item) -> None:
+        await report_error(interaction, error)
 
 
 class SearchModal(MarketModal, title="Search the Marketplace"):
@@ -578,8 +726,9 @@ class SearchModal(MarketModal, title="Search the Marketplace"):
         q = f"%{self.query.value.strip()}%"
         rows = db.execute(
             "SELECT * FROM listings WHERE status IN ('open', 'claimed') AND guild_id = ?"
-            " AND (item LIKE ? OR notes LIKE ? OR profession LIKE ?) ORDER BY id DESC LIMIT 60",
-            (interaction.guild_id, q, q, q),
+            " AND (item LIKE ? OR notes LIKE ? OR profession LIKE ? OR category LIKE ?)"
+            " ORDER BY id DESC LIMIT 60",
+            (interaction.guild_id, q, q, q, q),
         ).fetchall()
         await interaction.response.send_message(
             embed=listings_overview(rows, f"Results for “{self.query.value.strip()}”"), ephemeral=True)
@@ -599,7 +748,9 @@ class PanelView(discord.ui.View):
     @discord.ui.button(label="Sell an Item", emoji="💰", style=discord.ButtonStyle.success,
                        custom_id="panel:sell", row=0)
     async def sell(self, interaction: discord.Interaction, _):
-        await interaction.response.send_modal(SellModal())
+        await interaction.response.send_message(
+            "💰 What are you selling? Pick a category and a form will pop up.",
+            view=CategoryPickerView(), ephemeral=True)
 
     @discord.ui.button(label="Want to Buy", emoji="🔎", style=discord.ButtonStyle.primary,
                        custom_id="panel:wtb", row=0)
@@ -609,7 +760,9 @@ class PanelView(discord.ui.View):
     @discord.ui.button(label="Crafting Request", emoji="🔨", style=discord.ButtonStyle.primary,
                        custom_id="panel:craft", row=0)
     async def craft(self, interaction: discord.Interaction, _):
-        await interaction.response.send_modal(CraftModal())
+        await interaction.response.send_message(
+            "🔨 Which profession do you need? Pick one and a form will pop up.",
+            view=ProfessionPickerView(), ephemeral=True)
 
     @discord.ui.button(label="Browse", emoji="📜", style=discord.ButtonStyle.secondary,
                        custom_id="panel:browse", row=1)
@@ -665,7 +818,7 @@ class ListingButton(discord.ui.DynamicItem[discord.ui.Button],
 
     async def handle(self, interaction: discord.Interaction):
         row = get_listing(self.listing_id)
-        if row is None or row["status"] in ("done", "removed"):
+        if row is None or row["status"] in CLOSED_STATUSES:
             await interaction.response.send_message("This listing is already closed.", ephemeral=True)
             return
 
@@ -758,6 +911,55 @@ class ListingButton(discord.ui.DynamicItem[discord.ui.Button],
 
 
 # --------------------------------------------------------------------------
+# Listing expiry -- unclaimed listings close after LISTING_EXPIRY_DAYS
+# --------------------------------------------------------------------------
+
+async def expire_listing(bot: commands.Bot, row: sqlite3.Row) -> None:
+    update_listing(row["id"], status="expired")
+    row = get_listing(row["id"])
+    await update_announcement(bot, row)
+
+    # Delete the forum post (or the listing message if listings live in a text channel).
+    try:
+        channel = bot.get_channel(row["channel_id"]) or await bot.fetch_channel(row["channel_id"])
+    except discord.HTTPException:
+        channel = None
+    if isinstance(channel, discord.Thread) and isinstance(channel.parent, discord.ForumChannel):
+        await close_forum_post(channel, delete=True)
+    elif channel is not None and row["message_id"]:
+        try:
+            msg = await channel.fetch_message(row["message_id"])
+            await msg.delete()
+        except discord.HTTPException:
+            pass
+
+    # Let the poster know privately.
+    try:
+        owner = bot.get_user(row["user_id"]) or await bot.fetch_user(row["user_id"])
+        days = f"{LISTING_EXPIRY_DAYS:g}"
+        await owner.send(
+            f"⌛ Your listing **{row['item']}** expired after {days} day{'s' if days != '1' else ''} "
+            f"without being claimed. If it's still available, post it again from the marketplace panel.")
+    except discord.HTTPException:
+        pass  # DMs closed; nothing else to do
+
+
+@tasks.loop(minutes=15)
+async def expiry_check(bot: commands.Bot) -> None:
+    if LISTING_EXPIRY_DAYS <= 0:
+        return
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=LISTING_EXPIRY_DAYS)).isoformat()
+    rows = db.execute(
+        "SELECT * FROM listings WHERE status = 'open' AND created_at < ?", (cutoff,)).fetchall()
+    for row in rows:
+        try:
+            await expire_listing(bot, row)
+            print(f"Listing #{row['id']} ({row['item']}) expired.")
+        except Exception as e:  # never let one bad listing stop the checker
+            print(f"[!] Couldn't expire listing #{row['id']}: {e}")
+
+
+# --------------------------------------------------------------------------
 # Bot startup
 # --------------------------------------------------------------------------
 
@@ -772,12 +974,26 @@ class MarketplaceBot(commands.Bot):
         self.add_view(PanelView())
         self.add_dynamic_items(ListingButton)
 
+    async def on_raw_thread_delete(self, payload: discord.RawThreadDeleteEvent):
+        """Someone deleted a listing's forum post by hand: close the listing and clean up."""
+        row = db.execute(
+            "SELECT * FROM listings WHERE channel_id = ? AND status IN ('open', 'claimed')",
+            (payload.thread_id,)).fetchone()
+        if row is None:
+            return  # not a listing, or the bot already closed it
+        update_listing(row["id"], status="removed")
+        await update_announcement(self, get_listing(row["id"]))
+        print(f"Listing #{row['id']} ({row['item']}) was deleted in Discord, so it's now removed.")
+
     async def on_ready(self):
         print(f"Logged in as {self.user} (id {self.user.id})")
         if not self._panel_ready:
             self._panel_ready = True
             await refresh_panel(self)
             print("Marketplace panel is ready.")
+        if LISTING_EXPIRY_DAYS > 0 and not expiry_check.is_running():
+            expiry_check.start(self)
+            print(f"Unclaimed listings expire after {LISTING_EXPIRY_DAYS:g} day(s).")
 
 
 def main():
