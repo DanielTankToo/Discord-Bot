@@ -13,11 +13,13 @@ Members click buttons on a pinned panel to:
   * My Listings         -> private list of your own open listings
 
 Each listing has buttons to claim it, release it, mark it done, or remove it.
+Every form can include a picture/screenshot, shown big on the listing.
 Unclaimed listings expire automatically after LISTING_EXPIRY_DAYS (default 2).
 Gold and items change hands in-game; the bot only tracks listings.
 """
 
 import asyncio
+import io
 import os
 import re
 import sqlite3
@@ -148,6 +150,9 @@ if "activity_message_id" not in [c[1] for c in db.execute("PRAGMA table_info(lis
 # Upgrade older databases: item category for things for sale.
 if "category" not in [c[1] for c in db.execute("PRAGMA table_info(listings)")]:
     db.execute("ALTER TABLE listings ADD COLUMN category TEXT")
+# Upgrade older databases: file name of the listing's picture, if it has one.
+if "image_name" not in [c[1] for c in db.execute("PRAGMA table_info(listings)")]:
+    db.execute("ALTER TABLE listings ADD COLUMN image_name TEXT")
 # Upgrade older databases (column from an earlier version; no longer used).
 if "ping_message_id" not in [c[1] for c in db.execute("PRAGMA table_info(listings)")]:
     db.execute("ALTER TABLE listings ADD COLUMN ping_message_id INTEGER")
@@ -228,6 +233,10 @@ def listing_embed(row: sqlite3.Row) -> discord.Embed:
         expiry = expires_at(row)
         until = f" — expires <t:{int(expiry.timestamp())}:R> if nobody claims it" if expiry else ""
         embed.add_field(name="Status", value=f"🟢 Open{until}", inline=False)
+
+    if row["image_name"]:
+        # The picture is uploaded with the listing message; this shows it big in the embed.
+        embed.set_image(url=f"attachment://{row['image_name']}")
 
     embed.set_footer(text=f"Listing #{row['id']}")
     embed.timestamp = datetime.fromisoformat(row["created_at"])
@@ -478,7 +487,8 @@ def item_link(row: sqlite3.Row) -> str:
     return f"[{row['item']}]({jump_url(row)})"
 
 
-async def move_to_completed(bot: commands.Bot, row: sqlite3.Row) -> bool:
+async def move_to_completed(bot: commands.Bot, row: sqlite3.Row,
+                            files: list[discord.File] | None = None) -> bool:
     """Copy a finished listing into the completed channel. Returns True if it was posted."""
     if not COMPLETED_CHANNEL_ID:
         return False
@@ -490,17 +500,100 @@ async def move_to_completed(bot: commands.Bot, row: sqlite3.Row) -> bool:
     embed.add_field(name="Completed", value=f"<t:{int(datetime.now(timezone.utc).timestamp())}:f>",
                     inline=False)
     try:
-        msg = await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+        msg = await channel.send(embed=embed, **({"files": files} if files else {}),
+                                 allowed_mentions=discord.AllowedMentions.none())
     except discord.HTTPException as e:
-        print(f"[!] Couldn't post in the completed channel: {e}")
-        return False
+        if not files:
+            print(f"[!] Couldn't post in the completed channel: {e}")
+            return False
+        # Most likely the bot is missing Attach Files there: record the trade without the picture.
+        print(f"[!] Couldn't post the picture in the completed channel ({e}). "
+              "Give the bot 'Attach Files' in that channel. Posting the record without it.")
+        embed.set_image(url=None)
+        try:
+            msg = await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+        except discord.HTTPException as e2:
+            print(f"[!] Couldn't post in the completed channel: {e2}")
+            return False
     update_listing(row["id"], channel_id=channel.id, message_id=msg.id)
     return True
 
 
+# Biggest picture the bot will re-upload (Discord's upload limit for bots is 10 MB).
+MAX_PICTURE_BYTES = 10 * 1024 * 1024
+PICTURE_TYPES = (".png", ".jpg", ".jpeg", ".gif", ".webp")
+
+
+# The bot keeps its own copy of every listing picture here, so it can re-post it later
+# (e.g. in the completed channel) without depending on Discord's copy.
+PICTURES_DIR = os.getenv("PICTURES_DIR", "pictures")
+
+
+def picture_path(listing_id: int, image_name: str) -> str:
+    return os.path.join(PICTURES_DIR, f"{listing_id}-{image_name}")
+
+
+def save_picture(listing_id: int, image_name: str, data: bytes) -> None:
+    try:
+        os.makedirs(PICTURES_DIR, exist_ok=True)
+        with open(picture_path(listing_id, image_name), "wb") as f:
+            f.write(data)
+    except OSError as e:
+        print(f"[!] Couldn't save the picture for listing #{listing_id}: {e}")
+
+
+async def listing_picture_file(bot: commands.Bot, row: sqlite3.Row,
+                               message: discord.Message | None = None) -> discord.File | None:
+    """Get a listing's picture as a file to post: from the saved copy first, then from Discord."""
+    name = row["image_name"]
+    if not name:
+        return None
+    path = picture_path(row["id"], name)
+    if os.path.exists(path):
+        return discord.File(path, filename=name)
+
+    # No saved copy (e.g. listing posted before this update): take it from the listing message.
+    if message is None and row["channel_id"] and row["message_id"]:
+        try:
+            channel = bot.get_channel(row["channel_id"]) or await bot.fetch_channel(row["channel_id"])
+            message = await channel.fetch_message(row["message_id"])
+        except (discord.HTTPException, AttributeError):
+            message = None
+    if message is not None:
+        atts = [a for a in message.attachments if a.filename == name] or message.attachments
+        for att in atts:
+            try:
+                return await att.to_file(filename=name)
+            except discord.HTTPException as e:
+                print(f"[!] Couldn't download the picture for listing #{row['id']}: {e}")
+    print(f"[!] Couldn't find the picture for listing #{row['id']}, so the completed record has none.")
+    return None
+
+
+async def load_picture(picture: discord.Attachment | None) -> tuple[bytes | None, str | None, str | None]:
+    """Download an uploaded picture.
+    Returns (data, file name, None) on success, or (None, None, reason) if it can't be used."""
+    if picture is None:
+        return None, None, None
+    ext = os.path.splitext(picture.filename)[1].lower()
+    is_image = (picture.content_type or "").startswith("image/") or ext in PICTURE_TYPES
+    if not is_image:
+        return None, None, "That upload wasn't a picture, so the listing was posted without it."
+    if picture.size > MAX_PICTURE_BYTES:
+        return None, None, "That picture is over 10 MB, so the listing was posted without it."
+    if ext not in PICTURE_TYPES:
+        ext = ".png"
+    try:
+        return await picture.read(), f"picture{ext}", None
+    except discord.HTTPException as e:
+        print(f"[!] Couldn't download an uploaded picture: {e}")
+        return None, None, "The picture couldn't be loaded, so the listing was posted without it."
+
+
 async def post_listing(interaction: discord.Interaction, ltype: str, item: str, price: str | None,
                        quantity: str | None, notes: str | None, profession: str | None = None,
-                       from_picker: bool = False, category: str | None = None) -> None:
+                       from_picker: bool = False, category: str | None = None,
+                       picture: discord.Attachment | None = None) -> None:
     bot = interaction.client
     # Acknowledge right away (silently) so Discord doesn't time out while we post.
     if from_picker:
@@ -516,14 +609,21 @@ async def post_listing(interaction: discord.Interaction, ltype: str, item: str, 
             ephemeral=True)
         return
 
+    # Download the uploaded picture so it can be re-posted with the listing.
+    picture_data, image_name, picture_problem = await load_picture(picture)
+    picture_kwargs = ({"file": discord.File(io.BytesIO(picture_data), filename=image_name)}
+                      if picture_data else {})
+
     cur = db.execute(
         "INSERT INTO listings (type, guild_id, user_id, item, price, quantity, notes, profession,"
-        " category, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        " category, image_name, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (ltype, interaction.guild_id, interaction.user.id, item, price or None, quantity or None,
-         notes or None, profession, category, datetime.now(timezone.utc).isoformat()),
+         notes or None, profession, category, image_name, datetime.now(timezone.utc).isoformat()),
     )
     db.commit()
     row = get_listing(cur.lastrowid)
+    if picture_data:
+        save_picture(row["id"], image_name, picture_data)
 
     # Ping the profession role for crafting orders, if a role with that name exists.
     content = None
@@ -550,12 +650,12 @@ async def post_listing(interaction: discord.Interaction, ltype: str, item: str, 
                           + ([category] if category else []))
         created = await channel.create_thread(
             name=name[:100], content=content, embed=listing_embed(row), view=listing_view(row),
-            allowed_mentions=allowed, applied_tags=tags)
+            allowed_mentions=allowed, applied_tags=tags, **picture_kwargs)
         msg = created.message
         update_listing(row["id"], channel_id=created.thread.id, message_id=msg.id)
     else:
         msg = await channel.send(content=content, embed=listing_embed(row), view=listing_view(row),
-                                 allowed_mentions=allowed)
+                                 allowed_mentions=allowed, **picture_kwargs)
         update_listing(row["id"], channel_id=channel.id, message_id=msg.id)
 
     row = get_listing(row["id"])
@@ -573,7 +673,9 @@ async def post_listing(interaction: discord.Interaction, ltype: str, item: str, 
     info = TYPE_INFO[ltype]
     dm_sent = False
     try:
-        await interaction.user.send(f"{info['emoji']} Your listing **{item}** is posted: {msg.jump_url}")
+        note = f"\n⚠️ {picture_problem}" if picture_problem else ""
+        await interaction.user.send(
+            f"{info['emoji']} Your listing **{item}** is posted: {msg.jump_url}{note}")
         dm_sent = True
     except discord.HTTPException:
         pass  # the poster has DMs from server members turned off
@@ -586,7 +688,8 @@ async def post_listing(interaction: discord.Interaction, ltype: str, item: str, 
             pass
     if not dm_sent:
         # DMs closed: fall back to a private "only you can see this" message.
-        await interaction.followup.send(f"Posted! {msg.jump_url}", ephemeral=True)
+        note = f"\n⚠️ {picture_problem}" if picture_problem else ""
+        await interaction.followup.send(f"Posted! {msg.jump_url}{note}", ephemeral=True)
 
     # Keep the panel as the last message so it's always easy to find.
     # (In a forum, this instead makes sure the pinned panel post is still open.)
@@ -614,6 +717,30 @@ async def report_error(interaction: discord.Interaction, error: Exception) -> No
         pass
 
 
+def picture_field():
+    """The 'Picture' upload box shown at the top of each form.
+    Needs discord.py 2.6 or newer; on older versions the forms work without it."""
+    try:
+        return discord.ui.Label(
+            text="Picture / screenshot (optional)",
+            description="Add a screenshot of the item. It's shown big on your listing.",
+            component=discord.ui.FileUpload(required=False, min_values=0, max_values=1),
+        )
+    except (AttributeError, TypeError):
+        return None
+
+
+PICTURES_SUPPORTED = picture_field() is not None
+
+
+def uploaded_picture(modal: discord.ui.Modal) -> discord.Attachment | None:
+    field = getattr(modal, "picture", None)
+    if field is None:
+        return None
+    files = getattr(field.component, "values", None) or []
+    return files[0] if files else None
+
+
 class MarketModal(discord.ui.Modal):
     async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
         await report_error(interaction, error)
@@ -624,6 +751,8 @@ class MarketModal(discord.ui.Modal):
 # --------------------------------------------------------------------------
 
 class SellModal(MarketModal, title="Sell an Item"):
+    if PICTURES_SUPPORTED:
+        picture = picture_field()  # first in the form, so it's the main thing members see
     item = discord.ui.TextInput(label="Item", placeholder="e.g. Lifestone, Black Lotus", max_length=100)
     price = discord.ui.TextInput(label="Price (gold)", placeholder="e.g. 25g or 1g 50s", max_length=30)
     quantity = discord.ui.TextInput(label="Quantity", required=False, default="1", max_length=20)
@@ -638,10 +767,13 @@ class SellModal(MarketModal, title="Sell an Item"):
     async def on_submit(self, interaction: discord.Interaction):
         await post_listing(interaction, WTS, self.item.value.strip(), self.price.value.strip(),
                            self.quantity.value.strip(), self.notes.value.strip(),
-                           from_picker=True, category=self.category)
+                           from_picker=True, category=self.category,
+                           picture=uploaded_picture(self))
 
 
 class BuyModal(MarketModal, title="Want to Buy"):
+    if PICTURES_SUPPORTED:
+        picture = picture_field()  # first in the form, so it's the main thing members see
     item = discord.ui.TextInput(label="Item you want", max_length=100)
     price = discord.ui.TextInput(label="Paying up to (gold)", required=False,
                                  placeholder="Leave blank if open to offers", max_length=30)
@@ -651,10 +783,13 @@ class BuyModal(MarketModal, title="Want to Buy"):
 
     async def on_submit(self, interaction: discord.Interaction):
         await post_listing(interaction, WTB, self.item.value.strip(), self.price.value.strip(),
-                           self.quantity.value.strip(), self.notes.value.strip())
+                           self.quantity.value.strip(), self.notes.value.strip(),
+                           picture=uploaded_picture(self))
 
 
 class CraftModal(MarketModal, title="Crafting Request"):
+    if PICTURES_SUPPORTED:
+        picture = picture_field()  # first in the form, so it's the main thing members see
     item = discord.ui.TextInput(label="What do you want crafted?", max_length=100)
     materials = discord.ui.TextInput(label="Materials", required=False, max_length=200,
                                      placeholder="e.g. I have all mats / need the crafter to supply")
@@ -672,7 +807,8 @@ class CraftModal(MarketModal, title="Crafting Request"):
             self.notes.value.strip(),
         ]))
         await post_listing(interaction, CRAFT, self.item.value.strip(), self.price.value.strip(),
-                           None, notes, profession=self.profession, from_picker=True)
+                           None, notes, profession=self.profession, from_picker=True,
+                           picture=uploaded_picture(self))
 
 
 class CategorySelect(discord.ui.Select):
@@ -879,7 +1015,10 @@ class ListingButton(discord.ui.DynamicItem[discord.ui.Button],
             row = get_listing(row["id"])
             await interaction.response.edit_message(content=None, embed=listing_embed(row), view=None)
 
-            moved = await move_to_completed(interaction.client, row)
+            # Re-upload the listing's picture with the completed-channel record.
+            picture_file = await listing_picture_file(interaction.client, row, interaction.message)
+            moved = await move_to_completed(interaction.client, row,
+                                            [picture_file] if picture_file else None)
             if moved:
                 row = get_listing(row["id"])  # now points at the completed-channel copy
             await update_announcement(interaction.client, row)
@@ -987,6 +1126,9 @@ class MarketplaceBot(commands.Bot):
 
     async def on_ready(self):
         print(f"Logged in as {self.user} (id {self.user.id})")
+        if not PICTURES_SUPPORTED:
+            print(f"[!] Picture uploads are off: discord.py {discord.__version__} is too old. "
+                  "Run  pip install -U discord.py  and restart the bot.")
         if not self._panel_ready:
             self._panel_ready = True
             await refresh_panel(self)

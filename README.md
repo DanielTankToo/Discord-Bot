@@ -24,12 +24,30 @@ Built in Python with discord.py. It runs on your own PC, with no paid hosting.
 
 | Button | What it does |
 |---|---|
-| 💰 **Sell an Item** | Pick a category from a drop-down (Weapon, Cloth/Leather/Mail/Plate Armor, Material, Recipe, Consumable), then a form asks for item, price, quantity, notes. Creates a "For Sale" listing showing the category. |
-| 🔎 **Want to Buy** | Form: item, max price, quantity, notes. Creates a "Wanted" listing. |
-| 🔨 **Crafting Request** | Pick a profession from a drop-down (only you see it, and it disappears once you post), then a form asks for item, materials, tip, notes. Creates a "Crafting Order" forum post that pings everyone with that profession's role. The ping goes away with the post. |
+| 💰 **Sell an Item** | Pick a category from a drop-down (Weapon, Cloth/Leather/Mail/Plate Armor, Material, Recipe, Consumable), then a form asks for a picture, item, price, quantity, notes. Creates a "For Sale" listing showing the category. |
+| 🔎 **Want to Buy** | Form: picture, item, max price, quantity, notes. Creates a "Wanted" listing. |
+| 🔨 **Crafting Request** | Pick a profession from a drop-down (only you see it, and it disappears once you post), then a form asks for a picture, item, materials, tip, notes. Creates a "Crafting Order" forum post that pings everyone with that profession's role. The ping goes away with the post. |
 | 📜 **Browse** | Private list of all open listings with jump links. |
 | 🔍 **Search** | Private search by item name, notes, profession, or category (e.g. "plate"). |
 | 📋 **My Listings** | Private list of your own listings and claims. |
+
+### Pictures on listings
+
+The first box in every form is **Picture / screenshot (optional)**. Click it to pick an
+image from your PC (or paste a screenshot). The bot posts it as the big main image on the
+listing, and it also shows as the preview picture in the forum's post list. When the trade
+is marked done, the picture is copied into the completed channel too.
+
+The bot keeps its own copy of each picture in a `pictures` folder next to `bot.py`, so it
+can always add the picture to the completed record. You can delete old files in that folder
+whenever you like; they're only needed until the trade is finished.
+
+- One picture per listing, up to 10 MB (PNG, JPG, GIF or WEBP).
+- Skipping it is fine; the listing posts without a picture.
+- If the upload isn't a picture or is too big, the listing still posts and the poster's
+  confirmation DM says why the picture was left off.
+- Needs **discord.py 2.6 or newer**. On an older version the forms work without the
+  picture box, and the terminal shows a `[!]` line saying to update.
 
 ### Buttons on each listing
 
@@ -69,6 +87,7 @@ in progress. The bot checks every 15 minutes while it's running.
 | `requirements.txt` | Python libraries to install. |
 | `.env` | Your settings and secret token. **Never share or upload this.** |
 | `marketplace.db` | Created automatically. Stores all listings and history. **Back this up.** |
+| `pictures/` | Created automatically. The bot's copies of listing pictures. No need to push it to GitHub. |
 
 ---
 
@@ -114,7 +133,7 @@ No spaces or quotes go around the values.
    - Install Link: **Discord Provided Link**
    - Default Install Settings → Guild Install → Scopes: **bot**
    - Permissions: **View Channels, Send Messages, Embed Links, Read Message
-     History, Mention Everyone, Manage Threads, Create Public Threads,
+     History, Attach Files, Mention Everyone, Manage Threads, Create Public Threads,
      Send Messages in Threads**
    - **Save Changes**, open the install link, pick your server, and click **Authorize**.
 
@@ -139,9 +158,9 @@ No spaces or quotes go around the values.
    | Channel | Bot needs |
    |---|---|
    | Panel | View Channel, Send Messages, Embed Links, Read Message History |
-   | Forum | View Channel, Create Posts, Send Messages in Posts, Embed Links, Read Message History, **Manage Threads**, **Mention All Roles** |
+   | Forum | View Channel, Create Posts, Send Messages in Posts, Embed Links, **Attach Files**, Read Message History, **Manage Threads**, **Mention All Roles** |
    | Activity | View Channel, Send Messages, Read Message History |
-   | Completed | View Channel, Send Messages, Embed Links, Read Message History |
+   | Completed | View Channel, Send Messages, Embed Links, **Attach Files**, Read Message History |
 
 5. **Keeping channels clean (recommended):** for @everyone, turn off **Send Messages**
    in the panel, activity, and completed channels, and **Create Posts** in the forum.
@@ -189,6 +208,9 @@ No spaces or quotes go around the values.
 | Forum posts aren't deleted when sold | The bot needs **Manage Threads** in the forum, and access to the completed channel. |
 | Profession role isn't pinged | Check the terminal for a `[!]` line. Either no role matches the profession name, or the bot needs **Mention All Roles** in the listings forum. Members also need to be able to see the forum to get notified. |
 | Old listings disappeared right after updating | Expected: unclaimed listings older than 2 days expire on the first check. Set `LISTING_EXPIRY_DAYS=0` to turn expiry off. |
+| No picture box in the forms | Your discord.py is too old. In the bot folder's terminal run `pip install -U discord.py`, then restart the bot. Also update the Discord app if it's out of date. |
+| Completed record has no picture | Give the bot **Attach Files** in the completed channel, and check the terminal for a `[!]` line. Listings posted before the `pictures` folder existed may not carry their picture over. |
+| Listing posts but the picture is missing | The bot needs **Attach Files** in the forum (and completed channel). Check the DM you got; it says if the picture was too big or not an image. |
 | The bot posts a `[!]` line in the terminal | It's a warning that says what's wrong, usually a channel ID or permission. |
 
 ---
@@ -205,6 +227,7 @@ Copy the whole folder, including `.env` and `marketplace.db`, to the new machine
 
 - [x] Drop-down menu to pick the profession when submitting a crafting order
 - [x] Listings that expire automatically after X days
+- [x] Picture/screenshot upload on every listing form
 - [ ] Auctions with timed bidding
 - [ ] Trade reputation, so members can rate completed trades
 - [ ] Ping actual crafters from the guild roster tool instead of Discord roles
