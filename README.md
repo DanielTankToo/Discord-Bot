@@ -15,6 +15,7 @@ Built in Python with discord.py. It runs on your own Windows PC, with no paid ho
 |---|---|
 | Nov 2026 | **Pictures on listings.** Every form starts with a picture/screenshot upload. The picture is the big main image on the listing and is copied into the completed channel. |
 | Nov 2026 | **Automatic picture cleanup.** The bot keeps a copy of each picture only while the listing is open, then deletes it. |
+| Nov 2026 | If the bot can't post a listing, it says which permissions are missing and doesn't leave a broken listing behind. |
 | Nov 2026 | `.gitignore` added, so `.env`, `marketplace.db` and `pictures` never go to GitHub. |
 | Earlier | Sell category drop-down, profession drop-down for crafting orders, automatic listing expiry, forum tags, DM notifications. |
 
@@ -264,6 +265,7 @@ from your PC, and **reset the bot token** in the Developer Portal.
 | "This interaction failed" | The bot isn't running. Start it. |
 | "Didn't respond in time" | Clear **Interactions Endpoint URL** in the Developer Portal, then restart the bot. |
 | `403 Forbidden (50001): Missing Access` | The bot can't see a channel. Add the Guild Market role to that channel's permissions. Check the category too if it's private. |
+| "The bot isn't allowed to post in the listings channel" | The terminal's `[!]` line lists exactly which forum permissions are missing. Turn them on for the Guild Market role in the forum. If it mentions a moderator-only tag, either give the bot **Manage Threads** or edit that tag and untick **Only allow forum moderators to apply this tag**. |
 | `403 Forbidden (50013): Missing Permissions` | The bot can see the channel but is missing a permission from the permissions table. |
 | `'ForumChannel' object has no attribute ...` | You're running an old `bot.py`. Replace it with the latest. |
 | Forum posts aren't deleted when sold | The bot needs **Manage Threads** in the forum, and access to the completed channel. |

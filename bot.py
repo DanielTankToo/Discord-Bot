@@ -638,6 +638,28 @@ async def load_picture(picture: discord.Attachment | None) -> tuple[bytes | None
         return None, None, "The picture couldn't be loaded, so the listing was posted without it."
 
 
+def missing_listing_permissions(channel, tags: list, has_picture: bool) -> list[str]:
+    """Work out which permissions the bot lacks to post a listing in this channel."""
+    guild = getattr(channel, "guild", None)
+    if guild is None or guild.me is None:
+        return []
+    perms = channel.permissions_for(guild.me)
+    forum = isinstance(channel, discord.ForumChannel)
+    needed = [
+        ("View Channel", perms.view_channel),
+        ("Create Posts" if forum else "Send Messages", perms.send_messages),
+        ("Embed Links", perms.embed_links),
+        ("Read Message History", perms.read_message_history),
+    ]
+    if forum:
+        needed.append(("Send Messages in Posts", perms.send_messages_in_threads))
+    if has_picture:
+        needed.append(("Attach Files", perms.attach_files))
+    if any(getattr(t, "moderated", False) for t in tags):
+        needed.append(("Manage Threads (a matching forum tag is moderator-only)", perms.manage_threads))
+    return [name for name, ok in needed if not ok]
+
+
 async def post_listing(interaction: discord.Interaction, ltype: str, item: str, price: str | None,
                        quantity: str | None, notes: str | None, profession: str | None = None,
                        from_picker: bool = False, category: str | None = None,
@@ -690,21 +712,39 @@ async def post_listing(interaction: discord.Interaction, ltype: str, item: str, 
             content = f"{role.mention} — new crafting order!"
             allowed = discord.AllowedMentions(roles=[role])
 
-    if isinstance(channel, discord.ForumChannel):
-        # Each listing becomes its own forum post; trade talk happens inside it.
-        info = TYPE_INFO[ltype]
-        name = f"[{info['title']}] {item}" + (f" — {price}" if price else "")
-        tags = forum_tags(channel, TYPE_TAG_NAMES[ltype] + ([profession] if profession else [])
-                          + ([category] if category else []))
-        created = await channel.create_thread(
-            name=name[:100], content=content, embed=listing_embed(row), view=listing_view(row),
-            allowed_mentions=allowed, applied_tags=tags, **picture_kwargs)
-        msg = created.message
-        update_listing(row["id"], channel_id=created.thread.id, message_id=msg.id)
-    else:
-        msg = await channel.send(content=content, embed=listing_embed(row), view=listing_view(row),
-                                 allowed_mentions=allowed, **picture_kwargs)
-        update_listing(row["id"], channel_id=channel.id, message_id=msg.id)
+    tags = []
+    try:
+        if isinstance(channel, discord.ForumChannel):
+            # Each listing becomes its own forum post; trade talk happens inside it.
+            info = TYPE_INFO[ltype]
+            name = f"[{info['title']}] {item}" + (f" — {price}" if price else "")
+            tags = forum_tags(channel, TYPE_TAG_NAMES[ltype] + ([profession] if profession else [])
+                              + ([category] if category else []))
+            created = await channel.create_thread(
+                name=name[:100], content=content, embed=listing_embed(row), view=listing_view(row),
+                allowed_mentions=allowed, applied_tags=tags, **picture_kwargs)
+            msg = created.message
+            update_listing(row["id"], channel_id=created.thread.id, message_id=msg.id)
+        else:
+            msg = await channel.send(content=content, embed=listing_embed(row), view=listing_view(row),
+                                     allowed_mentions=allowed, **picture_kwargs)
+            update_listing(row["id"], channel_id=channel.id, message_id=msg.id)
+    except discord.Forbidden:
+        # Don't leave a half-made listing behind: mark it removed and tidy up its picture.
+        update_listing(row["id"], status="removed")
+        delete_picture(get_listing(row["id"]))
+        missing = missing_listing_permissions(channel, tags, bool(picture_kwargs))
+        print(f"[!] Couldn't post listing #{row['id']} ({item}) in #{channel.name}: the bot is "
+              f"missing permissions there. Missing: {', '.join(missing) or 'unknown, check the README table'}.")
+        await interaction.followup.send(
+            "Sorry, the bot isn't allowed to post in the listings channel yet, so your listing "
+            "wasn't posted. Please let an officer know.", ephemeral=True)
+        if from_picker:
+            try:
+                await interaction.delete_original_response()
+            except discord.HTTPException:
+                pass
+        return
 
     row = get_listing(row["id"])
     info = TYPE_INFO[ltype]
